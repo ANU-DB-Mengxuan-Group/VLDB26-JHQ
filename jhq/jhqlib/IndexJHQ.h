@@ -1,40 +1,13 @@
 #pragma once
 
-#include <algorithm>
-#include <faiss/Clustering.h>
-#include <faiss/IndexFlat.h>
 #include <faiss/IndexFlatCodes.h>
-#include <faiss/impl/AuxIndexStructures.h>
 #include <faiss/impl/FaissAssert.h>
-#include <faiss/impl/io.h>
-#include <faiss/utils/Heap.h>
-#include <faiss/utils/distances.h>
-#include <faiss/utils/utils.h>
-
-#include <immintrin.h>
 
 #include <cstdint>
-#include <faiss/utils/hamming.h>
-#include <iostream>
-#include <lapacke.h>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
-#include <random>
-#include <faiss/impl/ProductQuantizer.h>
 #include <vector>
-
-#ifdef __has_include
-#if __has_include(<openblas/cblas.h>)
-#include <openblas/cblas.h>
-#elif __has_include(<cblas.h>)
-#include <cblas.h>
-#elif __has_include(<cblas-openblas.h>)
-#include <cblas-openblas.h>
-#else
-#error "CBLAS header not found"
-#endif
-#else
-#include <cblas.h>
-#endif
 
 #if defined(__GNUC__) || defined(__clang__)
 #define LIKELY(x) __builtin_expect(!!(x), 1)
@@ -56,30 +29,73 @@
 namespace jhq_internal {
 #ifdef __AVX512F__
 static constexpr bool has_avx512 = true;
+static constexpr bool has_neon = false;
 static constexpr int simd_width = 16;
 #elif defined(__AVX2__)
 static constexpr bool has_avx512 = false;
+static constexpr bool has_neon = false;
 static constexpr int simd_width = 8;
+#elif defined(__aarch64__) || defined(__ARM_NEON) || defined(_M_ARM64)
+static constexpr bool has_avx512 = false;
+static constexpr bool has_neon = true;
+static constexpr int simd_width = 4;  
 #else
 static constexpr bool has_avx512 = false;
+static constexpr bool has_neon = false;
 static constexpr int simd_width = 1;
 #endif
 }
 
 namespace faiss {
 
+struct IOReader;
+struct IOWriter;
+
+struct ProductQuantizer;
+
 namespace jhq_internal {
 
 float erfinv_approx(float x);
-float fvec_L2sqr_avx512(const float* x, const float* y, size_t d);
-float fvec_L2sqr_avx2(const float* x, const float* y, size_t d);
 float fvec_L2sqr_dispatch(const float* x, const float* y, size_t d);
+
+FORCE_INLINE uint16_t float_to_bf16(float f)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &f, sizeof(bits));
+    uint32_t rounding_bias = ((bits >> 16) & 1) + 0x7FFF;
+    return static_cast<uint16_t>((bits + rounding_bias) >> 16);
+}
+
+FORCE_INLINE float bf16_to_float(uint16_t bf16)
+{
+    uint32_t bits = static_cast<uint32_t>(bf16) << 16;
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
 
 static constexpr size_t CACHE_LINE_SIZE = 64;
 static constexpr size_t AVX512_ALIGNMENT = 64;
 static constexpr size_t AVX2_ALIGNMENT = 32;
-static constexpr size_t MAX_ROTATE_SIZE_GB = 50;
-static constexpr size_t MAX_TRAIN_SIZE_GB = 50;
+static constexpr size_t NEON_ALIGNMENT = 16;
+
+
+#if defined(__aarch64__) || defined(__ARM_NEON) || defined(_M_ARM64)
+static constexpr size_t DEFAULT_SIMD_ALIGNMENT = NEON_ALIGNMENT;
+#elif defined(__AVX512F__)
+static constexpr size_t DEFAULT_SIMD_ALIGNMENT = AVX512_ALIGNMENT;
+#elif defined(__AVX2__)
+static constexpr size_t DEFAULT_SIMD_ALIGNMENT = AVX2_ALIGNMENT;
+#else
+static constexpr size_t DEFAULT_SIMD_ALIGNMENT = 16;  
+#endif
+
+
+
+
+
+static constexpr size_t DEFAULT_BATCH_MEMORY_BYTES = 4ULL * 1024 * 1024 * 1024;  
+size_t get_max_batch_memory_bytes(const char* env_var);
 
 template<size_t Alignment = AVX512_ALIGNMENT>
 class AlignedAllocator {
@@ -169,6 +185,25 @@ public:
         size_ = new_size;
     }
 
+    
+    
+    void resize_preserve(size_t new_size)
+    {
+        if (new_size > capacity_) {
+            T* new_data = nullptr;
+            if (new_size > 0) {
+                new_data = static_cast<T*>(AlignedAllocator<Alignment>::allocate(new_size * sizeof(T)));
+                if (data_ != nullptr && size_ > 0) {
+                    std::memcpy(new_data, data_, size_ * sizeof(T));
+                }
+            }
+            AlignedAllocator<Alignment>::deallocate(data_);
+            data_ = new_data;
+            capacity_ = new_size;
+        }
+        size_ = new_size;
+    }
+
     void clear() { size_ = 0; }
 
     T* data() { return data_; }
@@ -189,11 +224,15 @@ private:
 struct PreDecodedCodes {
     AlignedBuffer<uint8_t> primary_codes;
     AlignedBuffer<uint8_t> residual_codes;
+    AlignedBuffer<uint8_t> residual_codes_packed4;
+    std::vector<float> cross_terms;
+    std::vector<float> residual_norms;  
 
     size_t primary_stride;
     size_t residual_stride;
     size_t residual_level_stride;
     size_t residual_subspace_stride;
+    size_t residual_packed4_stride;
 
     int num_levels;
     int M;
@@ -213,6 +252,14 @@ struct PreDecodedCodes {
         return primary_codes.data() + vector_idx * primary_stride;
     }
 
+    inline uint8_t* get_primary_codes_mutable(idx_t vector_idx)
+    {
+        FAISS_THROW_IF_NOT_MSG(is_initialized, "PreDecodedCodes not initialized");
+        FAISS_THROW_IF_NOT_MSG(vector_idx * primary_stride < primary_codes.size(),
+            "Primary codes index out of bounds");
+        return primary_codes.data() + vector_idx * primary_stride;
+    }
+
     inline const uint8_t* get_residual_codes(idx_t vector_idx) const
     {
         FAISS_THROW_IF_NOT_MSG(is_initialized && num_levels > 1,
@@ -220,6 +267,29 @@ struct PreDecodedCodes {
         FAISS_THROW_IF_NOT_MSG(vector_idx * residual_stride < residual_codes.size(),
             "Residual codes index out of bounds");
         return residual_codes.data() + vector_idx * residual_stride;
+    }
+
+    inline uint8_t* get_residual_codes_mutable(idx_t vector_idx)
+    {
+        FAISS_THROW_IF_NOT_MSG(is_initialized && num_levels > 1,
+            "Residual codes not available");
+        FAISS_THROW_IF_NOT_MSG(vector_idx * residual_stride < residual_codes.size(),
+            "Residual codes index out of bounds");
+        return residual_codes.data() + vector_idx * residual_stride;
+    }
+
+    inline bool has_residual_codes_packed4() const
+    {
+        return residual_packed4_stride > 0 && !residual_codes_packed4.empty();
+    }
+
+    inline const uint8_t* get_residual_codes_packed4(idx_t vector_idx) const
+    {
+        FAISS_THROW_IF_NOT_MSG(has_residual_codes_packed4(),
+            "Packed 4-bit residual codes not available");
+        FAISS_THROW_IF_NOT_MSG(vector_idx * residual_packed4_stride < residual_codes_packed4.size(),
+            "Packed residual codes index out of bounds");
+        return residual_codes_packed4.data() + vector_idx * residual_packed4_stride;
     }
 
     inline uint8_t get_residual_code(idx_t vector_idx, int m, int level, int d) const
@@ -241,15 +311,20 @@ struct JHQSearchParameters : SearchParameters {
     ~JHQSearchParameters() override { }
 };
 
+struct JHQDistanceComputer;
+
 struct IndexJHQ : IndexFlatCodes {
 private:
     struct SearchWorkspace {
+        const IndexJHQ* owner = nullptr;
         jhq_internal::AlignedBuffer<float> query_rotated;
         jhq_internal::AlignedBuffer<float> primary_distance_table;
-        jhq_internal::AlignedBuffer<float> residual_distance_tables;
         jhq_internal::AlignedBuffer<float> all_primary_distances;
+        jhq_internal::AlignedBuffer<float> candidate_primary_distances;
         jhq_internal::AlignedBuffer<float> candidate_distances;
         jhq_internal::AlignedBuffer<idx_t> candidate_indices;
+        jhq_internal::AlignedBuffer<float> reconstructed_vector;
+        std::unique_ptr<JHQDistanceComputer> dc;
     };
 
 public:
@@ -259,20 +334,32 @@ public:
     std::vector<int> level_bits;
 
     bool use_jl_transform;
+    bool normalize_l2 = false;  
     bool use_analytical_init;
     float default_oversampling;
     bool verbose;
 
     std::vector<float> rotation_matrix;
+    std::vector<uint16_t> rotation_matrix_bf16;
+    bool use_bf16_rotation = false;
     bool is_rotation_trained;
 
-    std::vector<std::vector<std::vector<float>>> codewords;
-    std::vector<std::vector<std::vector<float>>> scalar_codebooks;
+    
+    
+    
+    std::vector<float> scalar_codebooks_flat_;
+    std::vector<size_t> scalar_codebook_level_offsets_;
+    bool scalar_codebooks_flat_valid_ = false;
 
     mutable bool residual_pq_dirty_ = true;
+    mutable bool primary_pq_dirty_ = true;
     bool use_kmeans_refinement;
     int kmeans_niter;
+    int kmeans_nredo;
     int kmeans_seed;
+    int64_t sample_primary = 0;       
+    int64_t sample_residual = 20000;  
+    bool random_sample_training = true;
 
     size_t residual_bits_per_subspace;
 
@@ -304,6 +391,10 @@ public:
     void reset();
 
     void add(idx_t n, const float* x) override;
+    
+    
+    
+    void add_pretransformed(idx_t n, const float* x_pretransformed);
     void reset_data();
 
     void search(
@@ -331,6 +422,8 @@ public:
     void set_default_oversampling(float oversampling);
     size_t get_memory_usage() const;
 
+    void compress_rotation_to_bf16();
+
     void apply_jl_rotation(idx_t n, const float* x_in, float* x_out) const;
 
     void compute_primary_distance_tables_flat(
@@ -344,7 +437,10 @@ public:
 
         if (!level_bits.empty()) {
             int K0 = 1 << level_bits[0];
-            base_requirement = std::max(base_requirement, static_cast<idx_t>(K0 * 50));
+            const idx_t probe_requirement = static_cast<idx_t>(K0 * 50);
+            if (probe_requirement > base_requirement) {
+                base_requirement = probe_requirement;
+            }
         }
 
         base_requirement *= M;
@@ -358,14 +454,23 @@ public:
         std::vector<size_t>& level_offsets) const;
 
     mutable std::unique_ptr<ProductQuantizer> residual_pq_;
+    mutable std::unique_ptr<ProductQuantizer> primary_pq_;
 
+    const ProductQuantizer* get_primary_product_quantizer() const;
     const ProductQuantizer* get_residual_product_quantizer() const;
     void mark_residual_tables_dirty() { residual_pq_dirty_ = true; }
+    const float* get_primary_centroids_ptr(int subspace_idx) const;
+    float* get_primary_centroids_ptr_mutable(int subspace_idx);
+    int primary_ksub() const;
+    const float* get_scalar_codebook_ptr(int subspace_idx, int level) const;
+    float* get_scalar_codebook_ptr_mutable(int subspace_idx, int level);
+    int scalar_codebook_ksub(int level) const;
+    void rebuild_scalar_codebooks_flat();
 
     void analytical_gaussian_init(const float* data, idx_t n, int dim, int k, float* centroids) const;
     void generate_qr_rotation_matrix(int random_seed = 1234);
 
-    void set_clustering_parameters(bool use_kmeans, int niter, int seed);
+    void set_clustering_parameters(bool use_kmeans, int niter, int nredo, int seed);
 
     void write(IOWriter* f) const;
     static IndexJHQ* read(IOReader* f);
@@ -385,15 +490,56 @@ public:
         const float* query_rotated,
         float* distance_table) const;
 
-    void extract_all_codes_after_add();
+    float compute_exact_distance_separated(idx_t vector_idx, const float* query_rotated) const;
+
+    void extract_all_codes_after_add(
+        bool compute_cross_terms = true,
+        bool compute_residual_norms = true);
     bool has_pre_decoded_codes() const;
     size_t get_pre_decoded_memory_usage() const;
+
+    const uint8_t* get_primary_codes_ptr(idx_t vector_idx) const
+    {
+        return separated_codes_.get_primary_codes(vector_idx);
+    }
+
+    const uint8_t* get_residual_codes_ptr(idx_t vector_idx) const
+    {
+        return separated_codes_.get_residual_codes(vector_idx);
+    }
+
+    size_t residual_subspace_stride() const
+    {
+        return separated_codes_.residual_subspace_stride;
+    }
+
+    size_t residual_level_stride() const
+    {
+        return separated_codes_.residual_level_stride;
+    }
 
 private:
     thread_local static SearchWorkspace workspace_;
 
-    void train_subspace_quantizers(int subspace_idx, idx_t n, const float* subspace_data, int random_seed);
+    float compute_exact_distance_separated_codes_scratch(
+        const uint8_t* primary_codes,
+        const uint8_t* residual_codes,
+        const float* query_rotated,
+        float* query_residual,
+        float* db_residual) const;
+
+    float compute_exact_distance_separated_scratch(
+        idx_t vector_idx,
+        const float* query_rotated,
+        float* query_residual,
+        float* db_residual) const;
+
+    void train_subspace_quantizers(int subspace_idx, idx_t n, std::vector<float>&& subspace_data, int random_seed);
     void encode_single_vector(const float* x, uint8_t* code) const;
+    void encode_single_vector_with_scratch(
+        const float* x,
+        uint8_t* code,
+        float* current_residual) const;
     void decode_single_code(const uint8_t* code, float* x) const;
     void validate_parameters() const;
     void compute_code_size();
@@ -439,10 +585,15 @@ private:
 
     void encode_to_separated_storage(idx_t n, const float* x_rotated) const;
     void encode_single_vector_separated(const float* x, idx_t vector_idx) const;
-    int find_best_centroid(const float* residual, const std::vector<float>& centroids, int K) const;
-    void subtract_centroid(float* residual, const std::vector<float>& centroids, int best_k) const;
+    void encode_single_vector_separated_with_scratch(
+        const float* x,
+        idx_t vector_idx,
+        float* current_residual) const;
+    int find_best_centroid(const float* residual, const float* centroids, int K) const;
+    int find_nearest_scalar_sorted(const float* codebook, int K, float value) const;
+    void subtract_centroid(float* residual, const float* centroids, int best_k) const;
     void encode_residual_levels_separated(int m, const float* residual, uint8_t* residual_dest, size_t& offset) const;
-    float compute_exact_distance_separated(idx_t vector_idx, const float* query_rotated) const;
+    void rebuild_residual_codes_packed4() const;
 };
 
 struct JHQDistanceComputer : FlatCodesDistanceComputer {
@@ -464,6 +615,10 @@ public:
     float quantization_scale;
     float quantization_offset;
 
+    std::vector<uint16_t> quantized_residual_tables;
+    float residual_quant_scale;
+    float residual_quant_offset;
+
     const int M;
     const int Ds;
     const int num_levels;
@@ -473,22 +628,46 @@ public:
     explicit JHQDistanceComputer(const IndexJHQ& idx);
 
     void set_query(const float* x) override;
+    void set_query_rotated(const float* x_rotated);
+    void set_query_rotated_with_lut(const float* x_rotated, const float* primary_lut);
+    void set_prefetch_lookahead(int lookahead)
+    {
+        prefetch_lookahead_ = (lookahead > 0) ? lookahead : 0;
+    }
     float distance_to_code(const uint8_t* code) final;
-    float operator()(idx_t i) override;
-    float symmetric_dis(idx_t i, idx_t j) override;
+    float operator()(idx_t i) final;
+    float symmetric_dis(idx_t i, idx_t j) final;
     void distances_batch_4(
         const idx_t idx0, const idx_t idx1, const idx_t idx2, const idx_t idx3,
-        float& dis0, float& dis1, float& dis2, float& dis3) override;
+        float& dis0, float& dis1, float& dis2, float& dis3) final;
 
-private:
+    float distance_to_index(idx_t vector_idx) const;
+    void distances_batch(
+        const idx_t* ids,
+        int n,
+        float* distances,
+        const float* precomputed_primary = nullptr);
+
+	private:
+	    int prefetch_lookahead_ = 8;
+	    float query_norm_sq_ = 0.0f;  
+
+    float distance_to_index_with_primary(
+        idx_t vector_idx,
+        float primary_distance,
+        bool has_primary_distance) const;
+
+	    bool use_br8_direct_dot_() const;
+	    float compute_br8_residual_direct_dot_(size_t vector_idx) const;
+
     void enable_quantization();
     void compute_and_quantize_tables();
     float precomputed_distance_to_code(const uint8_t* code) const;
     float distance_to_code_with_decoding(const uint8_t* code) const;
     void apply_rotation_to_query(const float* x);
     void compute_primary_distance_table();
-    void compute_residual_distance_tables();
     void compute_residual_buffer_sizes();
+    void compute_residual_distance_tables();
     float compute_precomputed_residual_distance(size_t vector_idx) const;
 };
 
@@ -521,8 +700,15 @@ float compute_cross_term_from_codes(
     size_t residual_subspace_stride,
     size_t residual_level_stride);
 
-} // namespace jhq_internal
+float compute_residual_norm_sq_from_codes(
+    const IndexJHQ& index,
+    const uint8_t* residual_codes,
+    size_t residual_subspace_stride,
+    size_t residual_level_stride);
+
+} 
 
 void write_index_jhq(const IndexJHQ* idx, IOWriter* f);
 IndexJHQ* read_index_jhq(IOReader* f);
-} // namespace faiss
+IndexJHQ* read_index_jhq(const char* fname);
+} 
