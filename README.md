@@ -69,7 +69,7 @@ The build system supports several configuration options:
 -DENABLE_CLANG_TIDY=ON            # Enable clang-tidy analysis (default: ON)
 -DENABLE_CLANG_FORMAT=ON          # Enable clang-format (default: ON)
 
-# FAISS options  
+# FAISS options
 -DFAISS_ENABLE_GPU=OFF            # Enable GPU support (default: OFF)
 -DFAISS_ENABLE_PYTHON=OFF         # Enable Python bindings (default: OFF)
 ```
@@ -79,7 +79,7 @@ The build system supports several configuration options:
 **C++ support issues:**
 ```bash
 # Check compiler version
-g++ --version      # Need GCC 14+  
+g++ --version      # Need GCC 14+
 
 # Ubuntu: Install newer GCC
 sudo apt install gcc-14 g++-14
@@ -109,13 +109,7 @@ cd ../..
 ```
 JHQ/
 ├── jhqlib/                  # Core implementation
-│   ├── IndexJHQ.h           # JQ/JHQ header
-│   ├── IndexJHQ.cpp         # JQ/JHQ implementation
-│   ├── IndexIVFJHQ.h        # IVFJQ/IVFJHQ header
-│   └── IndexIVFJHQ.h        # IVFJQ/IVFJHQ implementation
 ├── examples/                # Example programs
-│   ├── demo_ivfjhq_test.cpp # IVFJQ/IVFJHQ demo
-│   └── demo_jhq_test.cpp    # JQ/JHQ demo
 ├── external/                # Third-party submodule
 └── CMakeLists.txt           # Build configuration
 ```
@@ -159,33 +153,33 @@ def convert_embeddings(example):
             example['embedding'] = [float(x) for x in embedding_list]
         except (ValueError, SyntaxError):
             clean_str = example['embedding'].strip('[]')
-            string_values = [x.strip().strip('"').strip("'") 
+            string_values = [x.strip().strip('"').strip("'")
                            for x in clean_str.split(',')]
             example['embedding'] = [float(x) for x in string_values if x]
     elif isinstance(example['embedding'], list):
-        example['embedding'] = [float(x) if isinstance(x, str) else x 
+        example['embedding'] = [float(x) if isinstance(x, str) else x
                                for x in example['embedding']]
     return example
 
 def process_huggingface_dataset(dataset_name, output_dir, split="corpus"):
     """Download and convert HuggingFace dataset to .fvecs format."""
-    
+
     # Load dataset
     dataset_dict = load_dataset(dataset_name)
-    dataset = dataset_dict.get(split, dataset_dict.get("train", 
+    dataset = dataset_dict.get(split, dataset_dict.get("train",
                                list(dataset_dict.values())[0]))
-    
+
     # Convert embeddings
     dataset = dataset.map(convert_embeddings, num_proc=4)
-    
+
     # Extract embeddings and normalize
     embeddings = np.array(dataset['embedding'], dtype=np.float32)
     embeddings = normalize(embeddings, axis=1, norm='l2')
-    
+
     # Save as .fvecs
     output_file = f"{output_dir}/{dataset_name.replace('/', '_')}_base.fvecs"
     write_fvecs(output_file, embeddings)
-    
+
     print(f"Processed {len(embeddings):,} vectors to {output_file}")
     return embeddings
 ```
@@ -197,18 +191,18 @@ def create_train_query_split(embeddings, query_size=1000, seed=42):
     """Split embeddings into base and query sets."""
     np.random.seed(seed)
     n_total = len(embeddings)
-    
+
     if query_size >= n_total:
         raise ValueError(f"Query size ({query_size}) must be < total ({n_total})")
-    
+
     # Random query indices
     query_indices = np.random.choice(n_total, query_size, replace=False)
     base_mask = np.ones(n_total, dtype=bool)
     base_mask[query_indices] = False
-    
+
     query_vectors = embeddings[query_indices]
     base_vectors = embeddings[base_mask]
-    
+
     return base_vectors, query_vectors
 ```
 #### Ground Truth Computation
@@ -219,18 +213,18 @@ import faiss
 def compute_ground_truth(base_vectors, query_vectors, k=20, use_gpu=True):
     """Compute exact k-NN ground truth using FAISS."""
     dimension = base_vectors.shape[1]
-    
+
     # Create index
     if use_gpu and faiss.get_num_gpus() > 0:
         res = faiss.StandardGpuResources()
         index = faiss.GpuIndexFlatL2(res, dimension)
     else:
         index = faiss.IndexFlatL2(dimension)
-    
+
     # Add base vectors and search
     index.add(base_vectors.astype(np.float32))
     distances, labels = index.search(query_vectors.astype(np.float32), k)
-    
+
     return labels.astype(np.int32)
 ```
 
@@ -239,22 +233,22 @@ def compute_ground_truth(base_vectors, query_vectors, k=20, use_gpu=True):
 ```python
 def preprocess_dataset(dataset_name, output_dir, query_size=1000, k=20):
     """Complete preprocessing pipeline."""
-    
+
     # Step 1: Download and process
     embeddings = process_huggingface_dataset(dataset_name, output_dir)
-    
+
     # Step 2: Create train/query split
     base_vectors, query_vectors = create_train_query_split(embeddings, query_size)
-    
+
     # Step 3: Save splits
     dataset_clean = dataset_name.replace('/', '_')
     write_fvecs(f"{output_dir}/{dataset_clean}_base.fvecs", base_vectors)
     write_fvecs(f"{output_dir}/{dataset_clean}_query.fvecs", query_vectors)
-    
+
     # Step 4: Compute and save ground truth
     ground_truth = compute_ground_truth(base_vectors, query_vectors, k)
     write_ivecs(f"{output_dir}/{dataset_clean}_groundtruth.ivecs", ground_truth)
-    
+
     print(f"Preprocessing complete:")
     print(f"  Base vectors: {len(base_vectors):,}")
     print(f"  Query vectors: {len(query_vectors):,}")
