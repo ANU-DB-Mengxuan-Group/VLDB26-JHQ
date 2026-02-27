@@ -264,7 +264,10 @@ void IndexIVFJHQ::search_preassigned(idx_t n,
                                 heap_heapify<CMax<float, idx_t>>(
                                     candidate_keep,
                                     candidate_primary.data(),
-                                    candidate_locs.data());
+                                    candidate_locs.data(),
+                                    candidate_primary.data(),
+                                    candidate_locs.data(),
+                                    candidate_keep);
                                 heap_ready = true;
                             }
                             continue;
@@ -295,7 +298,7 @@ void IndexIVFJHQ::search_preassigned(idx_t n,
                     const idx_t loc = candidate_locs[ci];
                     const idx_t list_no = lo_listno(loc);
                     const idx_t offset = lo_offset(loc);
-                    if (list_no < 0) {
+                    if (list_no < 0 || static_cast<size_t>(list_no) >= nlist) {
                         continue;
                     }
 
@@ -498,7 +501,10 @@ void IndexIVFJHQ::search_preassigned_with_rotated_queries(
                                 heap_heapify<CMax<float, idx_t>>(
                                     candidate_keep,
                                     candidate_primary.data(),
-                                    candidate_locs.data());
+                                    candidate_locs.data(),
+                                    candidate_primary.data(),
+                                    candidate_locs.data(),
+                                    candidate_keep);
                                 heap_ready = true;
                             }
                             continue;
@@ -529,7 +535,7 @@ void IndexIVFJHQ::search_preassigned_with_rotated_queries(
                     const idx_t loc = candidate_locs[ci];
                     const idx_t list_no = lo_listno(loc);
                     const idx_t offset = lo_offset(loc);
-                    if (list_no < 0) {
+                    if (list_no < 0 || static_cast<size_t>(list_no) >= nlist) {
                         continue;
                     }
 
